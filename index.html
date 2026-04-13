@@ -414,6 +414,26 @@
     font-size: 12px; font-weight: 600; color: var(--primary-dark);
   }
 
+  /* ── Error Case Selector ── */
+  .sim-error-row { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; align-items: center; }
+  .sim-select-error {
+    padding: 7px 32px 7px 12px; border: 1.5px solid var(--danger); border-radius: 8px;
+    font-size: 13px; font-weight: 600; color: var(--danger); background: var(--danger-light);
+    cursor: pointer; font-family: inherit; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23dc2626' viewBox='0 0 16 16'%3E%3Cpath d='M8 11L3 6h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 10px center;
+    transition: border-color .15s;
+  }
+  .sim-select-error:focus { outline: none; box-shadow: 0 0 0 3px rgba(220,38,38,.15); }
+  .sim-error-label {
+    font-size: 12px; font-weight: 700; color: var(--danger); text-transform: uppercase;
+    letter-spacing: .04em; white-space: nowrap; display: flex; align-items: center; gap: 4px;
+  }
+  .sim-error-desc {
+    font-size: 12px; color: var(--gray-500); padding: 6px 12px;
+    background: var(--danger-light); border-radius: 8px; border-left: 3px solid var(--danger);
+  }
+
   /* Mobile sim */
   @media (max-width: 900px) {
     .sim-left { display: none; }
@@ -1520,6 +1540,11 @@
       </div>
       <div class="sim-selected-info" id="selInfo"></div>
     </div>
+    <div class="sim-error-row" id="simErrorRow" style="display:none">
+      <span class="sim-error-label">⚠️ 에러 시나리오</span>
+      <select class="sim-select-error" id="selErrorCase" onchange="onErrorCaseChange()"></select>
+      <div class="sim-error-desc" id="selErrorDesc"></div>
+    </div>
     <div class="sim-controls">
       <button class="sim-btn sim-btn-run" id="simRunBtn" onclick="runSimulation()">▶ 실행</button>
       <button class="sim-btn sim-btn-reset" onclick="resetSimulation()">↺ 초기화</button>
@@ -1667,8 +1692,25 @@ const SCENARIOS = {
     subtitle: (p) => `CREATE2로 ${p.chainName}(${p.chainId}) 결정론적 주소를 계산합니다`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'validation', label:'Zod 유효성 실패', desc:'chainName이 빈 값이거나 requestId 누락 시 ValidationError(400) 발생 → Kafka 에러 응답 발행' },
+      { key:'db-dup', label:'DB 중복 주소', desc:'계산된 주소가 이미 accounts 테이블에 존재 → 중복 감지 후 무시 처리' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), addr_=addr();
+      if (err==='validation') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.account.create 수신`, data:{request_id:'', chain_name:''}},
+        {id:2,tag:'error',label:'❌ Zod 유효성 검사 실패',dur:'<1ms', desc:'requestId 누락 또는 chainName 빈 값 → ValidationError 발생', data:{error:'ValidationError', code:'VALIDATION_ERROR', statusCode:400, field:'requestId', message:'Required', retryable:false}},
+        {id:3,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.account.created 토픽으로 에러 응답 발행', data:{request_id:'', message:'Required', address:null, status:'FAILED'}},
+      ];
+      if (err==='db-dup') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.account.create 수신 (${p.chainName})`, data:{request_id:rid, chain_name:p.chainName}},
+        {id:2,tag:'process',label:'camelCase 변환 & Zod 검증',dur:'<1ms', desc:'검증 통과', data:{requestId:rid, chainName:p.chainName}},
+        {id:3,tag:'process',label:'CREATE2 주소 계산',dur:'~5ms', desc:'결정론적 주소 계산 완료', data:{computed:addr_, chainId:p.chainId}},
+        {id:4,tag:'db',label:'SQLite 계정 저장 (중복 감지)',dur:'~2ms', desc:'⚠️ INSERT 시 UNIQUE 제약 → 중복 주소 무시 처리', data:{address:addr_, status:'ALREADY_EXISTS', '// 처리':'중복이면 무시하고 기존 레코드 유지'}},
+        {id:5,tag:'kafka',label:'Kafka 응답 발행 (정상)',dur:'~3ms', desc:'중복이어도 정상 응답 — 이미 생성된 주소 반환', data:{request_id:rid, address:addr_, chain_id:p.chainId, status:'CREATED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.account.create 수신 (체인: ${p.chainName})`,
@@ -1690,7 +1732,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', address:addr_, chain_id:p.chainId, status:'CREATED'}},
       ];
     },
-    result: () => ({ok:true, msg:'계정 생성 완료 — CREATE2 결정론적 주소 계산 후 DB 저장.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['account-create'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'계정 생성 완료 — CREATE2 결정론적 주소 계산 후 DB 저장.'}
   },
 
   'account-deploy': {
@@ -1698,8 +1740,37 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName}(${p.chainId})에 CREATE2 프록시 스마트 계정을 배포합니다`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'lock-fail', label:'분산 락 획득 실패', desc:'10회 재시도 모두 실패 → InfraError(LOCK_ACQUIRE_FAILED) → 에러 응답' },
+      { key:'bundler-fail', label:'Bundler 배포 실패', desc:'Bundler API 500 에러 → InfraError(BUNDLER_SEND_FAILED) → 에러 응답' },
+      { key:'registry-timeout', label:'Registry 폴링 타임아웃', desc:'20초(2초×10회) 내 Registry 미확인 → 타임아웃 에러' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), a=addr(), tx=txHash();
+      if (err==='lock-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.account.deploy 수신`, data:{request_id:rid, address:a.slice(0,20)+'...', chain_id:p.chainId}},
+        {id:2,tag:'process',label:'Zod 유효성 검사',dur:'<1ms', desc:'검증 통과', data:{requestId:rid.slice(0,18)+'...'}},
+        {id:3,tag:'error',label:'❌ 분산 락 획득 실패',dur:'~1s', desc:'10회 × 100ms 재시도 모두 실패 → 다른 프로세스가 이미 배포 중', data:{lockKey:`deploy:${p.chainId}:${a.slice(0,16)}...`, attempts:10, error:'InfraError', code:'LOCK_ACQUIRE_FAILED', '// 원인':'동일 주소에 대해 동시 배포 요청 진행 중'}},
+        {id:4,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.account.deployed 에러 응답', data:{request_id:rid.slice(0,18)+'...', message:'Lock acquire failed', status:'FAILED'}},
+      ];
+      if (err==='bundler-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.account.deploy 수신`, data:{request_id:rid, chain_id:p.chainId}},
+        {id:2,tag:'process',label:'Zod 검증 통과',dur:'<1ms', desc:'검증 통과', data:{valid:true}},
+        {id:3,tag:'redis',label:'분산 락 획득 ✓',dur:'~1ms', desc:'락 획득 성공', data:{lockKey:`deploy:${p.chainId}:${a.slice(0,16)}...`, acquired:true}},
+        {id:4,tag:'rpc',label:'Owner Nonce 조회 ✓',dur:'~50ms', desc:'Nonce 12 조회 성공', data:{nonce:'12'}},
+        {id:5,tag:'error',label:'❌ Bundler 배포 실패',dur:'~200ms', desc:'Bundler 내부 에러 (HTTP 500)', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', statusCode:502, cause:'Internal server error', retryable:true, '// 조치':'Bundler 서버 상태 확인 필요'}},
+        {id:6,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 발생해도 lock은 해제됨', data:{released:true}},
+        {id:7,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.account.deployed 에러 응답', data:{request_id:rid.slice(0,18)+'...', message:'Bundler send failed', status:'FAILED'}},
+      ];
+      if (err==='registry-timeout') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.account.deploy 수신`, data:{request_id:rid, chain_id:p.chainId}},
+        {id:2,tag:'redis',label:'락 획득 & Nonce 조회 ✓',dur:'~50ms', desc:'정상 진행', data:{lockAcquired:true, nonce:'12'}},
+        {id:3,tag:'bundler',label:'Bundler 배포 제출 ✓',dur:'~200ms', desc:'txHash 반환 성공', data:{txHash:tx.slice(0,20)+'...', status:'SUBMITTED'}},
+        {id:4,tag:'error',label:'❌ Registry 폴링 타임아웃',dur:'~20s', desc:'2초 간격 × 10회 폴링 모두 미확인 → 계약 배포는 제출됐으나 Registry 미반영', data:{attempts:'10/10', interval:'2000ms', totalWait:'20s', '// 원인':'블록 생성 지연 또는 Registry 인덱싱 지연', '// 조치':'txHash로 수동 확인 후 재시도'}},
+        {id:5,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'타임아웃이어도 락은 해제', data:{released:true}},
+        {id:6,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.account.deployed 에러 응답', data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', message:'Registry poll timeout', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.account.deploy 수신 (${p.chainName})`,
@@ -1730,7 +1801,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', address:a.slice(0,20)+'...', tx_hash:tx.slice(0,20)+'...', status:'DEPLOYED'}},
       ];
     },
-    result: () => ({ok:true, msg:'계정 배포 완료 — Registry 폴링 확인 후 배포 완료. 자동 집금 비동기.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['account-deploy'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'계정 배포 완료 — Registry 폴링 확인 후 배포 완료. 자동 집금 비동기.'}
   },
 
   'account-delete': {
@@ -1738,8 +1809,22 @@ const SCENARIOS = {
     subtitle: () => 'SQLite 계정 레코드 삭제 (NoReply 패턴 — 온체인 작업 없음)',
     networks: [], tokens: [],
     defaultNetwork: null, defaultToken: null,
-    steps: () => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'not-found', label:'계정 미존재', desc:'DB에 해당 주소 없음 → 삭제 0건, 에러 없이 무시 (NoReply이므로 응답 없음)' },
+      { key:'validation', label:'Zod 유효성 실패', desc:'address 형식 불일치 → ValidationError(400) → NoReply이므로 로그만 기록' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), a=addr();
+      if (err==='validation') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:'adapter.account.delete 수신', data:{request_id:rid, address:'invalid-addr'}},
+        {id:2,tag:'error',label:'❌ Zod 유효성 실패',dur:'<1ms', desc:'address가 /^0x[0-9a-fA-F]{40}$/ 불일치 → ValidationError', data:{error:'ValidationError', code:'VALIDATION_ERROR', field:'address', message:'Invalid EVM address format', '// NoReply':'응답 토픽 없음, 로그만 기록'}},
+      ];
+      if (err==='not-found') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:'adapter.account.delete 수신', data:{request_id:rid, address:a.slice(0,20)+'...'}},
+        {id:2,tag:'process',label:'Zod 유효성 검사 ✓',dur:'<1ms', desc:'검증 통과', data:{address:a.slice(0,20)+'...', valid:true}},
+        {id:3,tag:'db',label:'⚠️ SQLite 삭제 — 0건',dur:'~1ms', desc:'해당 주소 레코드 없음 → DELETE 영향 행 0건 (에러 아님)', data:{address:a.slice(0,20)+'...', deletedCount:0, '// 처리':'무시 — NoReply 패턴'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:'adapter.account.delete 토픽 수신',
@@ -1752,7 +1837,7 @@ const SCENARIOS = {
           data:{address:a.slice(0,20)+'...', deleted:true, '// 응답없음':'NoReply 패턴'}},
       ];
     },
-    result: () => ({ok:true, msg:'계정 삭제 완료 — NoReply 패턴: 응답 토픽 발행 없이 DB 삭제만 수행.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['account-delete'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'계정 삭제 완료 — NoReply 패턴: 응답 토픽 발행 없이 DB 삭제만 수행.'}
   },
 
   'deposit': {
@@ -1760,8 +1845,31 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} ${p.symbol} ${p.isNative?'(Native)':'(ERC-20)'} 입금 이벤트 처리`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'ws-parse', label:'WebSocket 파싱 실패', desc:'수신 데이터 JSON 파싱 실패 → 로그 기록 후 무시 (재연결 없음)' },
+      { key:'zod-fail', label:'Zod 스키마 검증 실패', desc:'txHash 형식 불일치 → ValidationError(400) → 이벤트 무시' },
+      { key:'kafka-fail', label:'Kafka 발행 실패 → Outbox 폴백', desc:'즉시 발행 실패 → Outbox 레코드 유지 → 5초 스케줄러가 재발행' },
+    ],
+    steps: (p, err) => {
       const tx=txHash(), from=addr(), to=addr();
+      if (err==='ws-parse') return [
+        {id:1,tag:'ws',label:'WebSocket 이벤트 수신',dur:'실시간', desc:`ws://host:8080/ws — 데이터 수신`, data:{raw:'{{invalid json...'}},
+        {id:2,tag:'error',label:'❌ JSON 파싱 실패',dur:'<1ms', desc:'JSON.parse() 실패 → SyntaxError → 로그 기록 후 이벤트 무시', data:{error:'SyntaxError', message:'Unexpected token', '// 처리':'이벤트 무시, 다음 메시지 대기', '// WebSocket':'연결은 유지됨'}},
+      ];
+      if (err==='zod-fail') return [
+        {id:1,tag:'ws',label:'WebSocket 이벤트 수신',dur:'실시간', desc:`ws://host:8080/ws — ${p.chainName} 이벤트`, data:{chain_id:p.chainId, tx_hash:'invalid', amount:p.amount}},
+        {id:2,tag:'process',label:'camelCase 변환 ✓',dur:'<1ms', desc:'변환 성공', data:{txHash:'invalid'}},
+        {id:3,tag:'error',label:'❌ Zod 스키마 검증 실패',dur:'<1ms', desc:'txHash가 0x+64hex 형식 불일치 → ValidationError', data:{error:'ValidationError', code:'VALIDATION_ERROR', field:'txHash', expected:'0x+64hex', received:'invalid', '// 처리':'이벤트 무시'}},
+      ];
+      if (err==='kafka-fail') return [
+        {id:1,tag:'ws',label:'WebSocket 이벤트 수신',dur:'실시간', desc:`ws://host:8080/ws — ${p.chainName} ${p.symbol} 입금`, data:{chain_id:p.chainId, tx_hash:tx.slice(0,20)+'...', amount:p.amount}},
+        {id:2,tag:'process',label:'camelCase 변환 & Zod 검증 ✓',dur:'<1ms', desc:'검증 통과', data:{valid:true}},
+        {id:3,tag:'db',label:'Outbox 테이블 저장 ✓',dur:'~2ms', desc:'Kafka 발행 전 DB 영속화 성공', data:{topic:'adapter.deposit.detected', status:'PENDING_PUBLISH'}},
+        {id:4,tag:'error',label:'❌ Kafka 즉시 발행 실패',dur:'~3s', desc:'Kafka 브로커 연결 실패 → 타임아웃', data:{error:'KafkaJSError', code:'KAFKA_SEND_FAILED', broker:'disconnected', '// Outbox':'레코드 유지됨'}},
+        {id:5,tag:'process',label:'⏳ Outbox 스케줄러 재발행 대기',dur:'~5s', desc:'5초 간격 스케줄러가 PENDING_PUBLISH 레코드 재발행 시도', data:{scheduler:'OutboxScheduler', interval:'5000ms', pattern:'at-least-once', '// 보장':'메시지 유실 방지'}},
+        {id:6,tag:'kafka',label:'✅ Outbox 재발행 성공',dur:'~5ms', desc:'스케줄러 재시도로 Kafka 발행 성공 → Outbox 삭제', data:{topic:'adapter.deposit.detected', tx_hash:tx.slice(0,20)+'...', retried:true, outboxDeleted:true}},
+      ];
       return [
         {id:1,tag:'ws',label:'WebSocket 이벤트 수신',dur:'실시간',
           desc:`ws://host:8080/ws — ${p.chainName} ${p.symbol} 입금 이벤트 수신`,
@@ -1789,7 +1897,7 @@ const SCENARIOS = {
           data:{symbol:p.symbol, chainId:p.chainId, target:'HotWallet', '// 실패시':'로그 기록만'}},
       ];
     },
-    result: () => ({ok:true, msg:'입금 감지 완료 — Outbox 패턴 at-least-once 보장. 집금 비동기 트리거.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['deposit'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'입금 감지 완료 — Outbox 패턴 at-least-once 보장. 집금 비동기 트리거.'}
   },
 
   'withdraw': {
@@ -1799,9 +1907,37 @@ const SCENARIOS = {
       : `${p.chainName} ${p.symbol} ERC-20 토큰 전송 → sendErc20Transfer`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'lock-fail', label:'분산 락 획득 실패', desc:'10회 재시도 실패 → InfraError(LOCK_ACQUIRE_FAILED) → 에러 응답' },
+      { key:'bundler-fail', label:'Bundler 제출 실패', desc:'Bundler HTTP 에러 → InfraError(BUNDLER_SEND_FAILED) → 에러 응답 (retryable)' },
+      { key:'rpc-timeout', label:'RPC 타임아웃', desc:'eth_getTransactionCount 타임아웃 → InfraError(RPC_TIMEOUT) → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), sender=addr(), receiver=addr(), tx=txHash();
       const gasUsed = p.isNative ? '21000' : '65000';
+      if (err==='lock-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.withdraw.request — ${p.chainName} ${p.display}`, data:{request_id:rid.slice(0,18)+'...', chain_id:p.chainId, amount:p.amount}},
+        {id:2,tag:'process',label:'Zod 검증 통과 ✓',dur:'<1ms', desc:'검증 통과', data:{valid:true}},
+        {id:3,tag:'error',label:'❌ 분산 락 획득 실패',dur:'~1s', desc:'10회 × 100ms 재시도 모두 실패', data:{lockKey:`withdraw:nonce:${p.chainId}:${sender.slice(0,16)}...`, attempts:10, error:'InfraError', code:'LOCK_ACQUIRE_FAILED', '// 원인':'동일 sender 주소에 대해 동시 출금 진행 중'}},
+        {id:4,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.withdraw.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Lock acquire failed', status:'FAILED'}},
+      ];
+      if (err==='bundler-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.withdraw.request — ${p.display}`, data:{request_id:rid.slice(0,18)+'...', amount:p.amount}},
+        {id:2,tag:'redis',label:'Zod 검증 & 락 획득 ✓',dur:'~1ms', desc:'검증 및 락 획득 성공', data:{lockAcquired:true}},
+        {id:3,tag:'rpc',label:'Pending Nonce 조회 ✓',dur:'~100ms', desc:'Nonce 7 조회 성공', data:{nonce:'7'}},
+        {id:4,tag:'process',label:`${p.isNative?'Native':'ERC-20'} Transfer 경로 선택`,dur:'<1ms', desc:'경로 결정', data:{path:p.isNative?'Native':'ERC-20'}},
+        {id:5,tag:'error',label:'❌ Bundler 제출 실패',dur:'~200ms', desc:'Bundler HTTP 500 에러 → Nonce 충돌 아님 → 1차 시도에서 즉시 실패', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', statusCode:502, isNonceConflict:false, '// 조치':'Bundler 서버 상태 확인'}},
+        {id:6,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 시에도 lock 해제', data:{released:true}},
+        {id:7,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.withdraw.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Bundler send failed', status:'FAILED'}},
+      ];
+      if (err==='rpc-timeout') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.withdraw.request`, data:{request_id:rid.slice(0,18)+'...'}},
+        {id:2,tag:'redis',label:'Zod 검증 & 락 획득 ✓',dur:'~1ms', desc:'검증 및 락 획득 성공', data:{lockAcquired:true}},
+        {id:3,tag:'error',label:'❌ RPC 타임아웃',dur:'~5s', desc:`${p.chainName} RPC eth_getTransactionCount 타임아웃 → InfraError`, data:{method:'eth_getTransactionCount', rpc:p.chainName, error:'InfraError', code:'RPC_TIMEOUT', timeout:'5000ms', retryable:true, '// 원인':'RPC 노드 응답 없음'}},
+        {id:4,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'타임아웃이어도 락은 해제', data:{released:true}},
+        {id:5,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.withdraw.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'RPC timeout', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.withdraw.request — ${p.chainName} ${p.display} 출금`,
@@ -1836,7 +1972,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'SUBMITTED', gas_fee:Number(gasUsed), chain_id:p.chainId}},
       ];
     },
-    result: () => ({ok:true, msg:'출금 완료 — SUBMITTED 반환. 이후 Confirm 요청으로 최종 확정.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['withdraw'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'출금 완료 — SUBMITTED 반환. 이후 Confirm 요청으로 최종 확정.'}
   },
 
   'withdraw-fail': {
@@ -1844,8 +1980,22 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} ${p.symbol} — Bundler Nonce 충돌 발생 시 1회 자동 재시도`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 재시도 성공', desc:'' },
+      { key:'double-fail', label:'2회 연속 실패', desc:'1차·2차 모두 Nonce 충돌 → 최대 재시도 초과 → InfraError 전파 → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), sender=addr(), tx=txHash();
+      if (err==='double-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.withdraw.request — ${p.chainName} ${p.display}`, data:{request_id:rid.slice(0,18)+'...', chain_id:p.chainId}},
+        {id:2,tag:'redis',label:'Zod 검증 & 락 획득',dur:'~1ms', desc:'검증 통과 → 분산 락 획득', data:{lockAcquired:true}},
+        {id:3,tag:'rpc',label:'Nonce 조회 (최초)',dur:'~50ms', desc:'eth_getTransactionCount(pending)', data:{nonce:'7'}},
+        {id:4,tag:'error',label:'❌ 1차 Bundler 실패 (nonce too low)',dur:'~200ms', desc:'Nonce 충돌 감지 → 100ms 대기 후 재시도', data:{error:'InfraError', cause:'"nonce too low"', isNonceConflict:true, retry:1}},
+        {id:5,tag:'rpc',label:'Nonce 재조회',dur:'~50ms', desc:'Nonce 갱신: 7 → 8', data:{refreshedNonce:'8'}},
+        {id:6,tag:'error',label:'❌ 2차 Bundler 실패 (nonce too low)',dur:'~200ms', desc:'2차에도 Nonce 충돌 → 최대 재시도 초과 → 에러 전파', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', cause:'"nonce too low (again)"', retryExhausted:true, maxRetries:1, '// 결과':'에러 응답 전파'}},
+        {id:7,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 시에도 lock 해제', data:{released:true}},
+        {id:8,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.withdraw.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Nonce conflict - max retries exceeded', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.withdraw.request — ${p.chainName} ${p.display}`,
@@ -1873,7 +2023,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'SUBMITTED', retried:true}},
       ];
     },
-    result: () => ({ok:true, msg:'Nonce 충돌 재시도 성공 — 100ms 대기 후 갱신 Nonce로 1회 재시도. 2회 연속 실패 시 에러 전파.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['withdraw-fail'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'Nonce 충돌 재시도 성공 — 100ms 대기 후 갱신 Nonce로 1회 재시도. 2회 연속 실패 시 에러 전파.'}
   },
 
   'payment': {
@@ -1881,8 +2031,33 @@ const SCENARIOS = {
     subtitle: (p) => `HotWallet → Settlement 주소로 ${p.symbol} 전송 (${p.chainName} 결제 체인)`,
     networks: ['K-Mainnet','Ethereum','ETH Sepolia','FUJI','Avalanche'], tokens: ['Native','USDC','USDT'],
     defaultNetwork: 'K-Mainnet', defaultToken: 'Native',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'token-not-found', label:'토큰 정보 미존재', desc:'DB·ENV·DEFAULT 모두 토큰 정보 없음 → NotFoundError(TOKEN_NOT_FOUND) → 에러 응답' },
+      { key:'lock-timeout', label:'분산 락 타임아웃', desc:'HotWallet 기준 락 획득 10회 실패 → InfraError → 에러 응답' },
+      { key:'bundler-fail', label:'Bundler 전송 실패', desc:'Bundler 에러 → InfraError(BUNDLER_SEND_FAILED) → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), tx=txHash();
+      if (err==='token-not-found') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.payment.request — ${p.chainName} ${p.symbol}`, data:{request_id:rid.slice(0,18)+'...', chain_name:p.chainName, symbol:'UNKNOWN_TOKEN'}},
+        {id:2,tag:'error',label:'❌ 토큰 정보 미존재',dur:'~1ms', desc:'1순위 DB → 2순위 ENV → 3순위 DEFAULT 모두 미발견', data:{error:'NotFoundError', code:'TOKEN_NOT_FOUND', symbol:'UNKNOWN_TOKEN', chainId:p.chainId, '// 조회순서':'DB → ENV → DEFAULT_DECIMALS', '// 해결':'config-register로 토큰 등록 필요'}},
+        {id:3,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.payment.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Token not found', status:'FAILED'}},
+      ];
+      if (err==='lock-timeout') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.payment.request`, data:{request_id:rid.slice(0,18)+'...'}},
+        {id:2,tag:'db',label:'토큰 정보 해석 ✓',dur:'~1ms', desc:'토큰 정보 조회 성공', data:{symbol:p.symbol, decimals:p.decimals}},
+        {id:3,tag:'error',label:'❌ 분산 락 타임아웃',dur:'~1s', desc:'HotWallet 기준 락 10회 재시도 실패', data:{lockKey:`withdraw:nonce:${p.chainId}:${HOT_WALLET.slice(0,16)}...`, error:'InfraError', code:'LOCK_ACQUIRE_FAILED'}},
+        {id:4,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.payment.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Lock acquire failed', status:'FAILED'}},
+      ];
+      if (err==='bundler-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.payment.request`, data:{request_id:rid.slice(0,18)+'...',amount:p.amount}},
+        {id:2,tag:'db',label:'토큰 정보 & 락 획득 ✓',dur:'~2ms', desc:'정상 진행', data:{symbol:p.symbol, lockAcquired:true}},
+        {id:3,tag:'rpc',label:'HotWallet Nonce 조회 ✓',dur:'~50ms', desc:'Nonce 15', data:{nonce:'15'}},
+        {id:4,tag:'error',label:'❌ Bundler 전송 실패',dur:'~200ms', desc:'Bundler HTTP 에러', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', '// Nonce충돌아님':'isNonceConflict=false'}},
+        {id:5,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 시에도 lock 해제', data:{released:true}},
+        {id:6,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.payment.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Bundler send failed', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.payment.request — ${p.chainName} ${p.display} 결제`,
@@ -1907,7 +2082,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'CONFIRMED', gas_fee:35000}},
       ];
     },
-    result: () => ({ok:true, msg:'결제 완료 — HotWallet→Settlement 전송. Receipt 즉시 조회로 CONFIRMED 반환.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['payment'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'결제 완료 — HotWallet→Settlement 전송. Receipt 즉시 조회로 CONFIRMED 반환.'}
   },
 
   'confirm': {
@@ -1915,8 +2090,25 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} 트랜잭션 컨펌 수 계산 및 TXCF/TXPD 판정`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 (TXCF)', desc:'' },
+      { key:'txpd', label:'Receipt 미발견 (TXPD)', desc:'아직 블록에 포함 안 됨 → receipt=null → TXPD (Pending) 상태 반환' },
+      { key:'tx-failed', label:'트랜잭션 실패 (revert)', desc:'receipt.status=0 (실패) → BusinessError → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), tx=txHash(), rb=p.blockNumber, lb=rb+7;
+      if (err==='txpd') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.common.confirm — ${p.chainName} tx 컨펌 요청`, data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', chain_id:p.chainId}},
+        {id:2,tag:'rpc',label:'Transaction Receipt 조회',dur:'~100ms', desc:'eth_getTransactionReceipt → null (아직 블록 미포함)', data:{method:'eth_getTransactionReceipt', rpc:p.chainName, result:null, '// 의미':'tx가 아직 mempool에 있거나 드랍됨'}},
+        {id:3,tag:'process',label:'TXPD 판정',dur:'<1ms', desc:'receipt === null → TXPD(Pending) 반환', data:{status:'TXPD', confirmCount:0, '// 판정':'receipt 없음 → Pending'}},
+        {id:4,tag:'kafka',label:'Kafka 응답 발행',dur:'~3ms', desc:'adapter.common.confirmed — TXPD', data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'TXPD', confirm_count:0}},
+      ];
+      if (err==='tx-failed') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.common.confirm — tx 컨펌 요청`, data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...'}},
+        {id:2,tag:'rpc',label:'Transaction Receipt 조회',dur:'~100ms', desc:'eth_getTransactionReceipt → status=0 (reverted)', data:{method:'eth_getTransactionReceipt', status:0, gasUsed:'21000', blockNumber:rb, '// 의미':'트랜잭션 실행 중 revert 발생'}},
+        {id:3,tag:'error',label:'❌ 트랜잭션 실패 (revert)',dur:'<1ms', desc:'receipt.status=0 → BusinessError 발생', data:{error:'BusinessError', code:'TX_REVERTED', statusCode:422, txHash:tx.slice(0,20)+'...', '// 원인':'컨트랙트 실행 실패 (잔액 부족, 권한 등)'}},
+        {id:4,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.common.confirmed 에러', data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'FAILED', message:'Transaction reverted'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.common.confirm — ${p.chainName} tx 컨펌 요청`,
@@ -1938,7 +2130,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'TXCF', confirm_count:8, chain_id:p.chainId}},
       ];
     },
-    result: () => ({ok:true, msg:'컨펌 확인 완료 — 8블록 컨펌 (TXCF) 반환.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['confirm'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'컨펌 확인 완료 — 8블록 컨펌 (TXCF) 반환.'}
   },
 
   'balance': {
@@ -1946,9 +2138,25 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} ${p.chainSymbol}(Native) + ${p.symbol}(ERC-20) 병렬 조회`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'rpc-fail', label:'RPC 호출 실패', desc:'eth_getBalance 또는 eth_call 실패 → InfraError(RPC_CALL_FAILED) → 에러 응답' },
+      { key:'no-chain', label:'활성 체인 없음', desc:'ConfigDB에 활성 체인 정보 없음 → 빈 결과 반환 (에러 아님)' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), a=addr();
       const nativeResult = p.symbol==='KRW' ? '(제외됨)' : '2300000000000000000';
+      if (err==='rpc-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:'adapter.balance.inquiry 수신', data:{request_id:rid.slice(0,18)+'...', address:a.slice(0,20)+'...'}},
+        {id:2,tag:'process',label:'활성 체인/토큰 목록 조회 ✓',dur:'<1ms', desc:`${p.chainName} 대상`, data:{chain:p.chainName, tokens:[p.chainSymbol, p.symbol]}},
+        {id:3,tag:'error',label:'❌ RPC 호출 실패',dur:'~5s', desc:`${p.chainName} RPC eth_getBalance 타임아웃/에러`, data:{error:'InfraError', code:'RPC_CALL_FAILED', method:'eth_getBalance', rpc:p.chainName, timeout:'5000ms', '// 원인':'RPC 노드 응답 없음 또는 네트워크 장애'}},
+        {id:4,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.balance.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'RPC call failed', status:'FAILED'}},
+      ];
+      if (err==='no-chain') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:'adapter.balance.inquiry 수신', data:{request_id:rid.slice(0,18)+'...'}},
+        {id:2,tag:'process',label:'⚠️ 활성 체인 0개',dur:'<1ms', desc:'ConfigDB에 활성 체인 정보 없음 → 빈 배열 반환', data:{activeChains:0, '// 원인':'config-register 미실행 또는 모든 체인 비활성'}},
+        {id:3,tag:'kafka',label:'Kafka 응답 발행 (빈 결과)',dur:'~3ms', desc:'adapter.balance.result — 빈 잔액 배열', data:{request_id:rid.slice(0,18)+'...', balances:'[]', status:'SUCCESS', '// 참고':'에러 아님, 빈 결과'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:'adapter.balance.inquiry 수신',
@@ -1974,7 +2182,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', balances:'[2 items]', status:'SUCCESS'}},
       ];
     },
-    result: () => ({ok:true, msg:'잔액 조회 완료 — Native + ERC-20 병렬 조회 결과 반환.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['balance'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'잔액 조회 완료 — Native + ERC-20 병렬 조회 결과 반환.'}
   },
 
   'settlement': {
@@ -1982,10 +2190,34 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} ${p.symbol} — EOFS Split 가맹점+수수료 동시 분배`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche'], tokens: ['USDC','USDT'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'nonce-conflict', label:'payerNonce 충돌 (EFS024)', desc:'EOFS Split Nonce 충돌 → 100ms 대기 후 1회 재시도 → 성공' },
+      { key:'nonce-double', label:'payerNonce 2회 연속 실패', desc:'1차·2차 모두 Nonce 충돌 → 최대 재시도 초과 → InfraError 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), merchant=addr(), tx=txHash();
       const mAmt=Math.floor(Number(p.amount)*0.9).toString();
       const fAmt=Math.floor(Number(p.amount)*0.1).toString();
+      if (err==='nonce-conflict') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.settlement.request — ${p.display} 정산`, data:{request_id:rid.slice(0,18)+'...', merchant_amount:mAmt, fee_amount:fAmt}},
+        {id:2,tag:'db',label:'토큰 정보 & 락 획득 ✓',dur:'~2ms', desc:'정상 진행', data:{symbol:p.symbol, lockAcquired:true}},
+        {id:3,tag:'rpc',label:'payerNonce 조회 ✓',dur:'~50ms', desc:'payerNonce()=23', data:{payerNonce:'23'}},
+        {id:4,tag:'error',label:'❌ EOFS Split 1차 실패 (EFS024)',dur:'~300ms', desc:'Bundler "nonce too low" → EFS024 Nonce 충돌', data:{error:'InfraError', code:'EFS024', cause:'"nonce too low"', isNonceConflict:true}},
+        {id:5,tag:'process',label:'100ms 대기 → payerNonce 재조회',dur:'~150ms', desc:'sleep(100ms) → payerNonce 재조회', data:{previousNonce:'23', refreshedNonce:'24', sleep:'100ms'}},
+        {id:6,tag:'bundler',label:'✅ EOFS Split 2차 성공',dur:'~300ms', desc:'갱신 Nonce(24)로 재시도 성공', data:{payerNonce:'24', txHash:tx.slice(0,20)+'...', status:'SUBMITTED'}},
+        {id:7,tag:'kafka',label:'Kafka 응답 발행',dur:'~3ms', desc:'adapter.settlement.result — 재시도 성공', data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'CONFIRMED', retried:true}},
+      ];
+      if (err==='nonce-double') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.settlement.request`, data:{request_id:rid.slice(0,18)+'...'}},
+        {id:2,tag:'db',label:'토큰 정보 & 락 획득 ✓',dur:'~2ms', desc:'정상 진행', data:{lockAcquired:true}},
+        {id:3,tag:'rpc',label:'payerNonce 조회 ✓',dur:'~50ms', desc:'payerNonce()=23', data:{payerNonce:'23'}},
+        {id:4,tag:'error',label:'❌ 1차 EOFS Split 실패 (nonce)',dur:'~300ms', desc:'Nonce 충돌 감지', data:{error:'EFS024', retry:1}},
+        {id:5,tag:'rpc',label:'payerNonce 재조회',dur:'~150ms', desc:'Nonce 갱신: 23→24', data:{refreshedNonce:'24'}},
+        {id:6,tag:'error',label:'❌ 2차 EOFS Split 실패 (nonce)',dur:'~300ms', desc:'2회 연속 Nonce 충돌 → 최대 재시도 초과', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', retryExhausted:true, '// 결과':'에러 전파'}},
+        {id:7,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 시에도 lock 해제', data:{released:true}},
+        {id:8,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.settlement.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Nonce conflict - max retries exceeded', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.settlement.request — ${p.display} 정산`,
@@ -2010,7 +2242,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'CONFIRMED', gas_fee:65000}},
       ];
     },
-    result: () => ({ok:true, msg:'정산 완료 — EOFS Split으로 가맹점+수수료 동시 분배.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['settlement'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'정산 완료 — EOFS Split으로 가맹점+수수료 동시 분배.'}
   },
 
   'settlement-collect': {
@@ -2018,8 +2250,30 @@ const SCENARIOS = {
     subtitle: (p) => `외부 주소 → HotWallet으로 ${p.symbol} 회수 (${p.chainName})`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche'], tokens: ['USDC','USDT'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'nonce-conflict', label:'payerNonce 충돌', desc:'EOFS Split Nonce 충돌 → 100ms 대기 후 1회 재시도 → 성공' },
+      { key:'bundler-fail', label:'Bundler 전송 실패', desc:'Bundler HTTP 에러 (Nonce 충돌 아님) → InfraError → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), from=addr(), tx=txHash();
+      if (err==='nonce-conflict') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.settlement.collect.request — ${p.display} 집금`, data:{request_id:rid.slice(0,18)+'...', from_address:from.slice(0,20)+'...'}},
+        {id:2,tag:'db',label:'토큰 정보 & 락 획득 ✓',dur:'~2ms', desc:'정상 진행', data:{symbol:p.symbol, lockAcquired:true}},
+        {id:3,tag:'rpc',label:'payerNonce 조회 ✓',dur:'~50ms', desc:'payerNonce()=5', data:{payerNonce:'5'}},
+        {id:4,tag:'error',label:'❌ EOFS Split 1차 실패 (nonce)',dur:'~300ms', desc:'Nonce 충돌 감지', data:{error:'EFS024', isNonceConflict:true}},
+        {id:5,tag:'rpc',label:'payerNonce 재조회',dur:'~150ms', desc:'Nonce 갱신: 5→6', data:{refreshedNonce:'6'}},
+        {id:6,tag:'bundler',label:'✅ EOFS Split 2차 성공',dur:'~300ms', desc:'갱신 Nonce로 재시도 성공', data:{payerNonce:'6', txHash:tx.slice(0,20)+'...', status:'SUBMITTED'}},
+        {id:7,tag:'kafka',label:'Kafka 응답 발행',dur:'~3ms', desc:'adapter.settlement.collect.result — 재시도 성공', data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'CONFIRMED'}},
+      ];
+      if (err==='bundler-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:`adapter.settlement.collect.request`, data:{request_id:rid.slice(0,18)+'...'}},
+        {id:2,tag:'db',label:'토큰 정보 & 락 획득 ✓',dur:'~2ms', desc:'정상 진행', data:{lockAcquired:true}},
+        {id:3,tag:'rpc',label:'payerNonce 조회 ✓',dur:'~50ms', desc:'payerNonce()=5', data:{payerNonce:'5'}},
+        {id:4,tag:'error',label:'❌ Bundler 전송 실패',dur:'~300ms', desc:'Bundler HTTP 에러 (Nonce 충돌 아님) → 즉시 에러', data:{error:'InfraError', code:'BUNDLER_SEND_FAILED', isNonceConflict:false, '// 조치':'Bundler 서버 상태 확인'}},
+        {id:5,tag:'redis',label:'분산 락 해제',dur:'<1ms', desc:'에러 시에도 lock 해제', data:{released:true}},
+        {id:6,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.settlement.collect.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Bundler send failed', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms',
           desc:`adapter.settlement.collect.request — ${p.display} 집금`,
@@ -2041,7 +2295,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', tx_hash:tx.slice(0,20)+'...', status:'CONFIRMED'}},
       ];
     },
-    result: () => ({ok:true, msg:'정산 집금 완료 — 외부 주소에서 HotWallet로 자금 회수 성공.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['settlement-collect'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'정산 집금 완료 — 외부 주소에서 HotWallet로 자금 회수 성공.'}
   },
 
   'collection': {
@@ -2049,8 +2303,29 @@ const SCENARIOS = {
     subtitle: (p) => `입금 감지 후 ${p.chainName} ${p.symbol} 토큰을 HotWallet로 자동 집금`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'no-gas', label:'Native 잔액 부족 (3회 재시도 실패)', desc:'가스비 Native 잔액이 3회 확인 후에도 0 → 집금 불가 → 에러 swallow + 로그' },
+      { key:'nonce-conflict', label:'Nonce 충돌', desc:'Bundler Nonce 충돌 → 캐시 무효화(invalidate) → 다음 입금 시 재시도' },
+    ],
+    steps: (p, err) => {
       const a=addr(), tx=txHash();
+      if (err==='no-gas') return [
+        {id:1,tag:'process',label:'집금 트리거 (입금 감지 후 자동)',dur:'자동', desc:`collectDeposit() 비동기 — ${p.chainName} ${p.symbol}`, data:{trigger:'deposit detected', address:a.slice(0,20)+'...'}},
+        {id:2,tag:'redis',label:'분산 락 획득 ✓',dur:'~1ms', desc:'집금 락 획득', data:{lockAcquired:true}},
+        {id:3,tag:'rpc',label:`Native 잔액 확인 (1/3)`,dur:'~100ms', desc:`Native 잔액 0 → 1초 대기`, data:{balance:'0', attempt:1, waiting:'1s'}},
+        {id:4,tag:'rpc',label:`Native 잔액 확인 (2/3)`,dur:'~100ms', desc:`Native 잔액 0 → 1초 대기`, data:{balance:'0', attempt:2, waiting:'1s'}},
+        {id:5,tag:'rpc',label:`Native 잔액 확인 (3/3)`,dur:'~100ms', desc:`Native 잔액 0 → 최대 재시도 도달`, data:{balance:'0', attempt:3, maxReached:true}},
+        {id:6,tag:'error',label:'⚠️ 가스비 부족 — 집금 포기',dur:'<1ms', desc:'3회 확인 모두 Native 잔액 0 → 집금 스킵 (에러 swallow)', data:{'// 처리':'에러 swallow', '// 로그':'warn 레벨 기록', '// 재시도':'다음 입금 시 자동 재시도'}},
+      ];
+      if (err==='nonce-conflict') return [
+        {id:1,tag:'process',label:'집금 트리거',dur:'자동', desc:`collectDeposit() 비동기`, data:{address:a.slice(0,20)+'...'}},
+        {id:2,tag:'redis',label:'락 획득 & Native 잔액 ✓',dur:'~1s', desc:'락 획득 성공, 가스비 확인', data:{lockAcquired:true, nativeBalance:'0.0001 '+p.chainSymbol}},
+        {id:3,tag:'process',label:'Nonce 캐시 조회',dur:'<1ms', desc:'인메모리 캐시 → Nonce 3', data:{cached:true, nonce:'3'}},
+        {id:4,tag:'error',label:'❌ Bundler Nonce 충돌',dur:'~200ms', desc:'Bundler "nonce too low" → 집금 실패', data:{error:'InfraError', cause:'"nonce too low"', currentNonce:'3', '// 의미':'다른 트랜잭션이 먼저 컨펌됨'}},
+        {id:5,tag:'process',label:'Nonce 캐시 무효화',dur:'<1ms', desc:'invalidate() → 캐시 삭제 → 다음 호출 시 RPC 재조회', data:{cacheKey:`${p.chainId}:${a.slice(0,10)}...`, action:'invalidate', '// 다음':'RPC에서 최신 Nonce 재조회'}},
+        {id:6,tag:'process',label:'⚠️ 에러 swallow',dur:'<1ms', desc:'집금 실패해도 에러 전파 없음 → 로그만 기록', data:{'// 재시도':'다음 입금 감지 시 자동 재시도', '// swallow':'true'}},
+      ];
       return [
         {id:1,tag:'process',label:'집금 트리거 (입금 감지 후 자동)',dur:'자동',
           desc:`collectDeposit() 비동기 호출 — ${p.chainName} ${p.symbol}`,
@@ -2074,7 +2349,7 @@ const SCENARIOS = {
           data:{cacheKey:`${p.chainId}:${a.slice(0,10)}...`, newNonce:'4', action:'advance'}},
       ];
     },
-    result: () => ({ok:true, msg:'집금 완료 — 실패 시 에러 swallow + 로그 기록. 다음 입금 시 재시도.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['collection'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'집금 완료 — 실패 시 에러 swallow + 로그 기록. 다음 입금 시 재시도.'}
   },
 
   'config-register': {
@@ -2082,7 +2357,24 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName}(${p.chainId}) + ${p.symbol} 설정을 RPC 자동 조회 후 DB 저장`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche','K-Mainnet'], tokens: ['USDC','USDT','Native'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'rpc-fail', label:'RPC 연결 실패', desc:'RPC 노드 응답 없음 → InfraError → NoReply이므로 로그만 기록' },
+      { key:'finalized-unsupported', label:'Finalized 블록 미지원', desc:'체인이 finalized 블록 미지원 → confirmation=1로 폴백 (에러 아님)' },
+    ],
+    steps: (p, err) => {
+      if (err==='rpc-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신 (NoReply)',dur:'<1ms', desc:'adapter.config.create 수신', data:{chain_id:p.chainId, chain_name:p.chainName, rpc_url:p.rpcUrl}},
+        {id:2,tag:'error',label:'❌ RPC 연결 실패',dur:'~5s', desc:`${p.chainName} RPC 노드 응답 없음 → 설정 등록 불가`, data:{error:'InfraError', code:'RPC_CALL_FAILED', rpcUrl:p.rpcUrl, timeout:'5000ms', '// NoReply':'응답 토픽 없음 → 로그만 기록', '// 조치':'RPC URL 확인 및 네트워크 연결 점검'}},
+      ];
+      if (err==='finalized-unsupported') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신 (NoReply)',dur:'<1ms', desc:'adapter.config.create 수신', data:{chain_id:p.chainId, rpc_url:p.rpcUrl}},
+        {id:2,tag:'rpc',label:'ERC-20 symbol/decimals 조회 ✓',dur:'~100ms', desc:'조회 성공', data:{symbol:p.symbol, decimals:p.decimals}},
+        {id:3,tag:'rpc',label:'블록 타임 계산 ✓',dur:'~200ms', desc:'100블록 샘플링 성공', data:{blockTime:'2초'}},
+        {id:4,tag:'rpc',label:'⚠️ Finalized 블록 미지원',dur:'~50ms', desc:'eth_getBlockByNumber("finalized") → 에러 → confirmation=1 폴백', data:{method:'eth_getBlockByNumber', tag:'"finalized"', error:'unsupported method', fallback:'confirmation=1', '// 참고':'일부 체인(L2 등)은 finalized 미지원'}},
+        {id:5,tag:'db',label:'체인 정보 저장 (confirmation=1)',dur:'~2ms', desc:'confirmation=1로 폴백 저장', data:{chainId:p.chainId, confirmation:1, blockTime:2, '// 폴백':'finalized 미지원 시 기본값 1'}},
+        {id:6,tag:'db',label:'토큰 정보 저장 ✓',dur:'~2ms', desc:'토큰 DB 저장 성공', data:{symbol:p.symbol, decimals:p.decimals}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신 (NoReply)',dur:'<1ms',
           desc:'adapter.config.create 수신 — 응답 토픽 없음 (NoReply)',
@@ -2108,7 +2400,7 @@ const SCENARIOS = {
           data:{chainId:p.chainId, symbol:p.symbol, decimals:p.decimals, tokenAddress:p.tokenAddress||'null'}},
       ];
     },
-    result: () => ({ok:true, msg:'설정 등록 완료 — NoReply. 블록 타임 자동 계산 후 체인+토큰 DB 저장.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['config-register'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'설정 등록 완료 — NoReply. 블록 타임 자동 계산 후 체인+토큰 DB 저장.'}
   },
 
   'reconciliation': {
@@ -2116,8 +2408,25 @@ const SCENARIOS = {
     subtitle: (p) => `${p.chainName} 특정 시점 온체인 잔액 집계 (별도 Worker)`,
     networks: ['FUJI','Ethereum','ETH Sepolia','Avalanche'], tokens: ['USDC','USDT'],
     defaultNetwork: 'FUJI', defaultToken: 'USDC',
-    steps: (p) => {
+    errorCases: [
+      { key:'none', label:'✅ 정상 처리', desc:'' },
+      { key:'binary-timeout', label:'Binary Search 타임아웃', desc:'블록 타임스탬프 조회 반복 중 RPC 타임아웃 → InfraError → 에러 응답' },
+      { key:'batch-fail', label:'배치 잔액 조회 실패', desc:'다수 계정 잔액 조회 중 RPC 에러 → 부분 실패 → 에러 응답' },
+    ],
+    steps: (p, err) => {
       const rid=uuid(), baseBlock=p.blockNumber-1000;
+      if (err==='binary-timeout') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신 (별도 Worker)',dur:'<1ms', desc:'adapter.reconciliation.inquiry — Consumer Group: bc-reconcile', data:{request_id:rid.slice(0,18)+'...', base_datetime:'20260413100000', chain_id:p.chainId}},
+        {id:2,tag:'error',label:'❌ Binary Search 타임아웃',dur:'~10s', desc:'기준 시점 블록 검색 중 RPC 반복 호출 타임아웃', data:{baseDatetime:'20260413100000', error:'InfraError', code:'RPC_TIMEOUT', method:'eth_getBlockByNumber', iterations:'>20', '// 원인':'RPC 노드 응답 지연 또는 블록 범위 너무 넓음'}},
+        {id:3,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.reconciliation.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Binary search timeout', status:'FAILED'}},
+      ];
+      if (err==='batch-fail') return [
+        {id:1,tag:'kafka',label:'Kafka 메시지 수신',dur:'<1ms', desc:'adapter.reconciliation.inquiry 수신', data:{request_id:rid.slice(0,18)+'...', base_datetime:'20260413100000'}},
+        {id:2,tag:'rpc',label:'기준 블록 Binary Search ✓',dur:'~500ms', desc:`블록 ${baseBlock} 확인`, data:{foundBlock:baseBlock}},
+        {id:3,tag:'db',label:'계정 목록 조회 ✓',dur:'~5ms', desc:'173개 계정 조회', data:{total:173}},
+        {id:4,tag:'error',label:'❌ 배치 잔액 조회 실패',dur:'~5s', desc:'100개씩 배치 중 2번째 배치에서 RPC 에러 → 전체 실패 처리', data:{batch:'2/2', batchSize:100, error:'InfraError', code:'RPC_CALL_FAILED', rpc:p.chainName, '// 의미':'부분 성공 불가 — 전체 재시도 필요'}},
+        {id:5,tag:'kafka',label:'Kafka 에러 응답 발행',dur:'~3ms', desc:'adapter.reconciliation.result 에러', data:{request_id:rid.slice(0,18)+'...', message:'Batch balance query failed', status:'FAILED'}},
+      ];
       return [
         {id:1,tag:'kafka',label:'Kafka 메시지 수신 (별도 Worker)',dur:'<1ms',
           desc:'adapter.reconciliation.inquiry — Consumer Group: bc-reconcile (메인과 분리)',
@@ -2139,7 +2448,7 @@ const SCENARIOS = {
           data:{request_id:rid.slice(0,18)+'...', base_block:baseBlock, user_raw:'50000000', platform_raw:'3000000', symbol:p.symbol}},
       ];
     },
-    result: () => ({ok:true, msg:'대사 완료 — 별도 Worker에서 Binary Search 블록 기준 point-in-time 잔액 집계 반환.'})
+    result: (s,err) => err ? {ok:false, msg:SCENARIOS['reconciliation'].errorCases.find(e=>e.key===err)?.desc} : {ok:true, msg:'대사 완료 — 별도 Worker에서 Binary Search 블록 기준 point-in-time 잔액 집계 반환.'}
   },
 };
 
@@ -2202,6 +2511,39 @@ function getSelectedPreset() {
   return buildPreset(net, tok);
 }
 
+function renderErrorCases(sc) {
+  const row = document.getElementById('simErrorRow');
+  const sel = document.getElementById('selErrorCase');
+  const desc = document.getElementById('selErrorDesc');
+  if (!sc.errorCases || sc.errorCases.length === 0) {
+    row.style.display = 'none';
+    sel.innerHTML = '';
+    desc.textContent = '';
+    return;
+  }
+  row.style.display = 'flex';
+  sel.innerHTML = sc.errorCases.map(e =>
+    `<option value="${e.key}">${e.label}</option>`
+  ).join('');
+  sel.value = 'none';
+  desc.textContent = '';
+}
+
+function onErrorCaseChange() {
+  if (simRunning) return;
+  const sc = SCENARIOS[currentScenario];
+  const errKey = document.getElementById('selErrorCase').value;
+  const ec = sc.errorCases?.find(e => e.key === errKey);
+  document.getElementById('selErrorDesc').textContent = ec && ec.key !== 'none' ? ec.desc : '';
+  renderScenarioContent(sc, getSelectedPreset());
+}
+
+function getSelectedError() {
+  const sel = document.getElementById('selErrorCase');
+  const v = sel ? sel.value : 'none';
+  return v === 'none' ? undefined : v;
+}
+
 function onSelectorChange() {
   if (simRunning) return;
   const sc = SCENARIOS[currentScenario];
@@ -2210,9 +2552,10 @@ function onSelectorChange() {
 }
 
 function renderScenarioContent(sc, p) {
+  const err = getSelectedError();
   document.getElementById('simTitle').textContent = typeof sc.title === 'function' ? sc.title(p) : sc.title;
   document.getElementById('simSubtitle').textContent = typeof sc.subtitle === 'function' ? sc.subtitle(p) : sc.subtitle;
-  currentSteps = sc.steps(p);
+  currentSteps = sc.steps(p, err);
   document.getElementById('simSteps').innerHTML = currentSteps.map(stepHtml).join('');
   document.getElementById('simResult').innerHTML = '';
   document.getElementById('simRunBtn').disabled = false;
@@ -2227,6 +2570,7 @@ function loadScenario(key) {
   if (btn) btn.classList.add('active');
   const sc = SCENARIOS[key];
   renderSelectors(sc);
+  renderErrorCases(sc);
   // set defaults
   const selNet = document.getElementById('selNetwork');
   const selTok = document.getElementById('selToken');
@@ -2243,7 +2587,8 @@ async function runSimulation() {
   btn.disabled = true; btn.textContent = '⏳ 실행 중...';
   const sc = SCENARIOS[currentScenario];
   const p = getSelectedPreset();
-  const steps = sc.steps(p);
+  const err = getSelectedError();
+  const steps = sc.steps(p, err);
   const speed = parseInt(document.getElementById('simSpeed').value);
   document.getElementById('simSteps').innerHTML = steps.map(stepHtml).join('');
   document.getElementById('simResult').innerHTML = '';
@@ -2256,7 +2601,7 @@ async function runSimulation() {
     el.classList.add(steps[i].tag === 'error' ? 'error-step' : 'done');
     el.querySelector('.sim-step-dot').textContent = steps[i].tag === 'error' ? '✕' : '✓';
   }
-  const res = sc.result(steps);
+  const res = sc.result(steps, err);
   document.getElementById('simResult').innerHTML = `
     <div class="sim-result-box ${res.ok?'success':'fail'}">
       <strong>${res.ok?'✅ 성공':'❌ 실패'}</strong><br>${res.msg}
